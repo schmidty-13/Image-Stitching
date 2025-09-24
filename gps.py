@@ -30,7 +30,7 @@ def extract_gps(image_path):
         return None, None
 
 
-def gps_to_xy(lat, lon, epsg_out="EPSG:32633"):
+def gps_to_xy(lat, lon, epsg_out="EPSG:32617"):  # UTM Zone 17N for Columbus, OH
     """Convert lat/lon to projected (x, y) coordinates (e.g. UTM)."""
     transformer = Transformer.from_crs("EPSG:4326", epsg_out, always_xy=True)
     x, y = transformer.transform(lon, lat)

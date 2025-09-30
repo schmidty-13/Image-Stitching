@@ -8,10 +8,10 @@ from pyproj import Transformer
 # ------------------------
 # Tunables
 # ------------------------
-GSD_M_PER_PX = 0.03          # meters per pixel (assumed constant per your original)
+GSD_M_PER_PX = 0.03          # meters per pixel (assumed constant)
 MIN_GOOD_MATCHES = 20        # need at least this many descriptor matches after Lowe ratio
 RANSAC_REPROJ_THRESH = 3.0   # px; robustness of affine fit
-MAX_NEIGHBOR_DIST_M = 100.0   # only try keypoint refine if GPS-predicted centers within this many meters
+MAX_NEIGHBOR_DIST_M = 100.0  # only try keypoint refine if GPS-predicted centers within this many meters
 ORB_NFEATURES = 4000         # ORB feature cap
 LOWE_RATIO = 0.75            # Lowe ratio test threshold
 
@@ -68,7 +68,7 @@ def ll_to_xy(T, lat, lon):
     return np.array([x, y], dtype=np.float32)
 
 # ------------------------
-# Warps
+# Affine helpers
 # ------------------------
 def gps_affine_to_canvas(center_xy_m, ref_xy_m, gsd_m_per_px, img_w, img_h):
     """
@@ -97,6 +97,10 @@ def corners_after_affine(w, h, A):
     pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float32).reshape(-1,1,2)
     warped = cv2.transform(pts, A).reshape(-1, 2)
     return warped
+
+def make_shift(dx, dy):
+    return np.array([[1, 0, dx],
+                     [0, 1, dy]], dtype=np.float32)
 
 # ------------------------
 # Keypoint refine (ORB + RANSAC affine)
@@ -136,7 +140,7 @@ def estimate_affine_from_matches(img_src, img_dst):
     return A.astype(np.float32), inliers_count
 
 # ------------------------
-# Main mosaic
+# Main mosaic with dynamic canvas growth (Option A)
 # ------------------------
 def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mosaic_gps_kp.jpg"):
     # 1) Load images & EXIF
@@ -146,7 +150,7 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
             continue
         path = os.path.join(folder, fn)
         img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None: 
+        if img is None:
             continue
         lat, lon = read_latlon(path)
         items.append({
@@ -182,7 +186,7 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
         else:
             it["A_gps"] = gps_affine_to_canvas(it["xy_m"], ref_xy, gsd_m_per_px, w, h)
 
-    # 5) Determine canvas bounds using GPS-only placement
+    # 5) Determine initial canvas bounds using GPS-only placement (may grow later)
     all_corners = []
     for it in items:
         if it["A_gps"] is None:
@@ -201,33 +205,86 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
                       [0, 1, -min_y]], dtype=np.float32)
     out_w, out_h = int(max_x - min_x), int(max_y - min_y)
 
-    # 6) Prepare blending accumulators
+    # 6) Prepare blending accumulators + ability to grow canvas
     pano = np.zeros((out_h, out_w, 3), np.float32)
     acc  = np.zeros((out_h, out_w), np.float32)
 
-    # Track placed images with their final canvas warp
-    placed = []
+    # Keep track of a global extra shift we apply to any new A_canvas
+    extra_shift = np.array([[1, 0, 0],
+                            [0, 1, 0]], dtype=np.float32)
+
+    placed = []  # indices of placed images in 'items'
+
+    def apply_global_shift(A):
+        # Compose: current global shift @ A
+        return compose_affine(extra_shift, A)
+
+    def corners_of_img_on_canvas(img_w, img_h, A_canvas):
+        return corners_after_affine(img_w, img_h, A_canvas)
+
+    def grow_canvas_if_needed(A_canvas, img_shape):
+        """
+        If A_canvas would place the image outside current pano bounds,
+        enlarge pano/acc, update out_w/out_h, and shift stored affines when adding left/top.
+        """
+        nonlocal pano, acc, out_w, out_h, extra_shift
+        h, w = img_shape[:2]
+        # Corners under the CURRENT A_canvas (already includes whatever shift you passed in)
+        cs = corners_of_img_on_canvas(w, h, A_canvas)
+        min_xy = np.floor(cs.min(0)).astype(int)
+        max_xy = np.ceil(cs.max(0)).astype(int)
+        min_xc, min_yc = int(min_xy[0]), int(min_xy[1])
+        max_xc, max_yc = int(max_xy[0]), int(max_xy[1])
+
+        pad_left   = max(0, -min_xc)
+        pad_top    = max(0, -min_yc)
+        pad_right  = max(0, max_xc - out_w)
+        pad_bottom = max(0, max_yc - out_h)
+
+        if pad_left or pad_top or pad_right or pad_bottom:
+            new_w = out_w + pad_left + pad_right
+            new_h = out_h + pad_top + pad_bottom
+
+            new_pano = np.zeros((new_h, new_w, 3), np.float32)
+            new_acc  = np.zeros((new_h, new_w), np.float32)
+
+            # Paste old into new at offset (pad_top, pad_left)
+            new_pano[pad_top:pad_top+out_h, pad_left:pad_left+out_w] = pano
+            new_acc [pad_top:pad_top+out_h, pad_left:pad_left+out_w] = acc
+
+            pano, acc = new_pano, new_acc
+            out_w, out_h = new_w, new_h
+
+            # If we added left/top padding, future and past affines must be shifted
+            if pad_left or pad_top:
+                pad_shift = make_shift(pad_left, pad_top)
+                # Update global extra shift so future compositions include it
+                extra_shift = compose_affine(pad_shift, extra_shift)
+                # Also shift any A_canvas already stored on placed items
+                for j in placed:
+                    items[j]["A_canvas"] = compose_affine(pad_shift, items[j]["A_canvas"])
+
+            # Return an updated A_canvas (if we added left/top, the image’s placement needs the same shift)
+            A_canvas = apply_global_shift(A_canvas)
+
+        return A_canvas
 
     # Utility to blend an image with a 2x3 affine into the pano
     def blend_into(img, A_canvas):
+        nonlocal pano, acc
         h, w = img.shape[:2]
         warped = cv2.warpAffine(img, A_canvas, (out_w, out_h))
         m = (warped.sum(axis=2) > 0).astype(np.float32)
         # incremental feathered averaging
-        nonlocal pano, acc
         pano = (pano * acc[..., None] + warped.astype(np.float32) * m[..., None]) / np.clip(acc[..., None] + m[..., None], 1e-6, None)
         acc += m
 
     # 7) Place images
-    # Strategy:
-    #   - seed with the first GPS image (GPS-only)
-    #   - for each next image (prefer those near placed ones), try keypoint refine against nearest neighbor
-    #   - if refine fails, fall back to GPS-only affine
-
-    # Seed
+    # Seed with the first GPS image (GPS-only)
     seed_idx = next(i for i, it in enumerate(items) if it["A_gps"] is not None)
     it0 = items[seed_idx]
     A0_canvas = compose_affine(shift, it0["A_gps"])
+    A0_canvas = grow_canvas_if_needed(A0_canvas, it0["img"].shape)
     blend_into(it0["img"], A0_canvas)
     it0["A_canvas"] = A0_canvas
     placed.append(seed_idx)
@@ -269,7 +326,7 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
                     placed,
                     key=lambda j: np.linalg.norm(items[best_i]["xy_m"] - items[j]["xy_m"]) if items[j]["xy_m"] is not None else float('inf')
                 )
-                # Make sure neighbor has a valid warp
+                # Ensure neighbor has a valid warp
                 if items[neighbor_j].get("A_canvas") is None:
                     neighbor_j = None
 
@@ -281,19 +338,18 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
                     A_neighbor_canvas = items[neighbor_j]["A_canvas"]
                     A_candidate_canvas = compose_affine(A_neighbor_canvas, A_ij)
 
-                    # Simple sanity: check the candidate center isn't crazy far from GPS center
-                    # Measure predicted center from both warps
+                    # Sanity: check candidate center vs GPS center
                     center = np.array([[w/2.0, h/2.0]], np.float32).reshape(-1,1,2)
                     c_gps = cv2.transform(center, A_gps_canvas).reshape(-1,2)[0]
                     c_kp  = cv2.transform(center, A_candidate_canvas).reshape(-1,2)[0]
-                    if np.linalg.norm(c_kp - c_gps) < (100.0 / gsd_m_per_px):  # e.g., within 100 m
+                    if np.linalg.norm(c_kp - c_gps) < (100.0 / gsd_m_per_px):  # within 100 m
                         A_final_canvas = A_candidate_canvas
                         used_refine = True
 
             if A_final_canvas is None:
                 A_final_canvas = A_gps_canvas
         else:
-            # No GPS → if any neighbor exists, we can still try pure keypoints to a placed neighbor
+            # No GPS → try pure keypoints to a placed neighbor
             neighbor_j = placed[-1]  # last placed as a fallback
             A_ij, inl = estimate_affine_from_matches(it["img"], items[neighbor_j]["img"])
             if A_ij is not None:
@@ -305,13 +361,15 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
                 remaining.remove(best_i)
                 continue
 
+        # Ensure canvas is large enough for this placement
+        A_final_canvas = grow_canvas_if_needed(A_final_canvas, it["img"].shape)
+
         # Blend
         blend_into(it["img"], A_final_canvas)
         it["A_canvas"] = A_final_canvas
         placed.append(best_i)
         remaining.remove(best_i)
 
-        # (Optional) print progress
         print(f"Placed {it['name']}  | refine={'yes' if used_refine else 'no'}  | canvas set.")
 
     # 8) Save
@@ -319,6 +377,6 @@ def mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mo
     cv2.imwrite(output, out)
     print(f"Saved {output} ({out_w}x{out_h}), GSD={gsd_m_per_px} m/px")
 
+
 if __name__ == "__main__":
     mosaic_gps_keypoints(folder="images/", gsd_m_per_px=GSD_M_PER_PX, output="mosaic_gps_kp.jpg")
-
